@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
-# compress_encrypt.sh (fixed for macOS Bash 3.2 compatibility)
+# protector.sh
+# v4
 # macOS 15.3+ and Ubuntu 24.04+ compatible
-# Purpose: Select one or more files/directories, compress to .tar.gz, encrypt with OpenSSL AES-256-CBC,
-# and save the encrypted archive to a chosen directory, with robust GUI/CLI fallbacks and timestamped logs.
+# Purpose: Prompt-driven encrypt/decrypt workflow.
+#  - Encrypt: select files/dirs -> compress to .tar.gz -> encrypt to .tar.gz.enc
+#  - Decrypt: select .enc -> decrypt to .tar.gz -> optional extraction
+# Notes:
+#  - Uses AES-256-CBC with salt; prefers -md sha256 and -pbkdf2 -iter 200000 when supported.
+#  - GUI pickers on macOS (AppleScript) and Linux (Zenity/KDialog) with CLI fallbacks.
+#  - No use of 'mapfile' to remain compatible with macOS Bash 3.2.
+#  - Timestamps use YYYY/MM/DD HH:MM:SS.
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -49,8 +56,8 @@ if [ "$OPENSSL_HAS_PBKDF2" != true ]; then
   log_warn "OpenSSL without -pbkdf2 detected. Will use legacy key derivation. Consider upgrading OpenSSL for stronger KDF."
 fi
 
-# ---------- GUI helpers ----------
-choose_sources_gui_macos() {
+# ---------- GUI helpers (macOS) ----------
+choose_sources_gui_macos_encrypt() {
   # AppleScript dialog allowing multi-select of files or folders
   # Returns newline-separated POSIX paths on stdout
   /usr/bin/osascript 2>/dev/null <<'APPLESCRIPT'
@@ -80,6 +87,18 @@ return outText
 APPLESCRIPT
 }
 
+choose_file_gui_macos_decrypt() {
+  /usr/bin/osascript 2>/dev/null <<'APPLESCRIPT'
+try
+  set f to choose file with prompt "Choose an encrypted .enc file to decrypt:"
+  set p to POSIX path of (f as text)
+  return p
+on error number -128
+  return
+end try
+APPLESCRIPT
+}
+
 choose_directory_gui_macos() {
   /usr/bin/osascript 2>/dev/null <<'APPLESCRIPT'
 try
@@ -91,7 +110,8 @@ end try
 APPLESCRIPT
 }
 
-choose_sources_gui_linux() {
+# ---------- GUI helpers (Linux) ----------
+choose_sources_gui_linux_encrypt() {
   # Try zenity or kdialog; allow multi-select for files and folders in two steps
   if command -v zenity >/dev/null 2>&1; then
     local files="" dirs=""
@@ -109,6 +129,16 @@ choose_sources_gui_linux() {
   fi
 }
 
+choose_file_gui_linux_decrypt() {
+  if command -v zenity >/dev/null 2>&1; then
+    zenity --file-selection --title="Select encrypted .enc file" || true
+  elif command -v kdialog >/dev/null 2>&1; then
+    kdialog --getopenfilename ~ "*.enc" 2>/dev/null || true
+  else
+    return 1
+  fi
+}
+
 choose_directory_gui_linux() {
   if command -v zenity >/dev/null 2>&1; then
     zenity --file-selection --directory --title="Select target save directory" || true
@@ -120,7 +150,30 @@ choose_directory_gui_linux() {
 }
 
 # ---------- CLI fallbacks ----------
-prompt_sources_cli() {
+prompt_mode_cli() {
+  local choice=""
+  printf "%s [INPUT] Choose mode: [E]ncrypt or [D]ecrypt: " "$(ts)"
+  read -r choice
+  case "${choice}" in
+    E|e|Encrypt|encrypt) printf "encrypt";;
+    D|d|Decrypt|decrypt) printf "decrypt";;
+    *) printf "encrypt";; # default
+  esac
+}
+
+prompt_yes_no_cli() {
+  local q="$1"
+  local def="${2:-N}"
+  local ans=""
+  printf "%s [INPUT] %s [y/N]: " "$(ts)" "$q"
+  read -r ans
+  case "${ans:-$def}" in
+    y|Y) return 0 ;;
+    *)   return 1 ;;
+  esac
+}
+
+prompt_sources_cli_encrypt() {
   log_info "Enter one or more source paths (files and/or directories)."
   log_info "Tip: paste multiple lines; finish with an empty line."
   local line
@@ -129,14 +182,27 @@ prompt_sources_cli() {
     [ -z "$line" ] && break
     out+=("$line")
   done
-  # Print one per line
   for p in "${out[@]}"; do printf "%s\n" "$p"; done | sed '/^$/d'
+}
+
+prompt_file_cli_decrypt() {
+  local f=""
+  while true; do
+    read -r -p "$(ts) [INPUT] Path to encrypted .enc file: " f
+    [ -z "$f" ] && { log_warn "Path cannot be empty."; continue; }
+    if [ -f "$f" ]; then
+      printf "%s\n" "$f"
+      return 0
+    else
+      log_warn "File not found: $f"
+    fi
+  done
 }
 
 prompt_directory_cli() {
   local d=""
   while true; do
-    read -r -p "$(ts) [INPUT] Target save directory path: " d
+    read -r -p "$(ts) [INPUT] Target directory path: " d
     [ -z "$d" ] && { log_warn "Directory path cannot be empty."; continue; }
     if [ -d "$d" ] && [ -w "$d" ]; then
       printf "%s\n" "$d"
@@ -165,7 +231,7 @@ validate_sources() {
 }
 
 # ---------- Passphrase input (confirm match) ----------
-read_passphrase() {
+read_passphrase_confirm() {
   local p1 p2
   while true; do
     read -r -s -p "$(ts) [INPUT] Enter encryption passphrase: " p1; printf "\n"
@@ -180,113 +246,288 @@ read_passphrase() {
   done
 }
 
-# ---------- Main selection flow ----------
-log_info "Selecting sources…"
-SOURCES=""
-if [ "$is_macos" = true ]; then
-  SOURCES="$(choose_sources_gui_macos || true)"
-elif [ "$is_linux" = true ]; then
-  SOURCES="$(choose_sources_gui_linux || true)"
-fi
+read_passphrase_once() {
+  local p1
+  while true; do
+    read -r -s -p "$(ts) [INPUT] Enter decryption passphrase: " p1; printf "\n"
+    [ -z "$p1" ] && { log_warn "Passphrase cannot be empty."; continue; }
+    printf "%s" "$p1"
+    return 0
+  done
+}
 
-if [ -z "${SOURCES:-}" ]; then
-  log_info "Falling back to CLI source selection."
-  SOURCES="$(prompt_sources_cli)"
-fi
+# ---------- OpenSSL arg builders ----------
+build_openssl_enc_args() {
+  # stdout: space-separated args for encryption (excluding -pass)
+  local out=(-e -aes-256-cbc -salt -a)
+  if [ "$OPENSSL_HAS_MD_SHA256" = true ]; then
+    out+=(-md sha256)
+  fi
+  if [ "$OPENSSL_HAS_PBKDF2" = true ]; then
+    out+=(-pbkdf2 -iter 200000)
+  else
+    log_warn "Using legacy key derivation (no -pbkdf2)."
+  fi
+  printf "%s " "${out[@]}"
+}
 
-# Validate and build array (portable; no mapfile)
-SOURCE_ARRAY=()
-while IFS= read -r __line; do
-  SOURCE_ARRAY+=("$__line")
-done < <(printf "%s\n" "$SOURCES" | validate_sources)
+build_openssl_dec_args() {
+  # stdout: space-separated args for decryption (excluding -pass)
+  local out=(-d -aes-256-cbc -a)
+  if [ "$OPENSSL_HAS_MD_SHA256" = true ]; then
+    out+=(-md sha256)
+  fi
+  if [ "$OPENSSL_HAS_PBKDF2" = true ]; then
+    out+=(-pbkdf2 -iter 200000)
+  fi
+  printf "%s " "${out[@]}"
+}
 
-log_info "Selected ${#SOURCE_ARRAY[@]} source(s):"
-for s in "${SOURCE_ARRAY[@]}"; do printf "%s %s\n" "$(ts)" "$s"; done
+# ---------- Mode prompt ----------
+choose_mode() {
+  local mode=""
+  if $is_macos; then
+    # Try GUI prompt via AppleScript; fall back to CLI
+    mode="$(/usr/bin/osascript 2>/dev/null <<'APPLESCRIPT'
+try
+  set theChoice to button returned of (display dialog "Choose mode:" buttons {"Cancel", "Decrypt", "Encrypt"} default button "Encrypt")
+  if theChoice is "Encrypt" then
+    return "encrypt"
+  else if theChoice is "Decrypt" then
+    return "decrypt"
+  else
+    return ""
+  end if
+on error number -128
+  return ""
+end try
+APPLESCRIPT
+)"
+    if [ -z "${mode:-}" ]; then
+      mode="$(prompt_mode_cli)"
+    fi
+  else
+    mode="$(prompt_mode_cli)"
+  fi
+  printf "%s" "$mode"
+}
 
-# ---------- Choose save directory ----------
-log_info "Selecting target save directory…"
-TARGET_DIR=""
-if [ "$is_macos" = true ]; then
-  TARGET_DIR="$(choose_directory_gui_macos || true)"
-elif [ "$is_linux" = true ]; then
-  TARGET_DIR="$(choose_directory_gui_linux || true)"
-fi
-if [ -z "${TARGET_DIR:-}" ]; then
-  log_info "Falling back to CLI directory prompt."
-  TARGET_DIR="$(prompt_directory_cli)"
-fi
+# ---------- Encrypt workflow ----------
+run_encrypt() {
+  log_info "Mode: ENCRYPT"
 
-# Ensure it exists and is writable
-if [ ! -d "$TARGET_DIR" ] || [ ! -w "$TARGET_DIR" ]; then
-  log_error "Target directory is not writable: $TARGET_DIR"
-  exit 1
-fi
-# Strip trailing slash to keep names tidy
-TARGET_DIR="${TARGET_DIR%/}"
+  log_info "Selecting sources…"
+  local SOURCES=""
+  if [ "$is_macos" = true ]; then
+    SOURCES="$(choose_sources_gui_macos_encrypt || true)"
+  elif [ "$is_linux" = true ]; then
+    SOURCES="$(choose_sources_gui_linux_encrypt || true)"
+  fi
+  if [ -z "${SOURCES:-}" ]; then
+    log_info "Falling back to CLI source selection."
+    SOURCES="$(prompt_sources_cli_encrypt)"
+  fi
 
-# ---------- Determine archive base name ----------
-default_base="archive_$(date +'%Y%m%d_%H%M%S')"
-printf "%s [INPUT] Archive base name (no extension) [%s]: " "$(ts)" "$default_base"
-read -r ARCHIVE_BASE
-ARCHIVE_BASE="${ARCHIVE_BASE:-$default_base}"
+  local SOURCE_ARRAY=()
+  while IFS= read -r __line; do
+    SOURCE_ARRAY+=("$__line")
+  done < <(printf "%s\n" "$SOURCES" | validate_sources)
 
-ARCHIVE_TMP_NAME="${ARCHIVE_BASE}.tar.gz"
-ARCHIVE_ENC_NAME="${ARCHIVE_TMP_NAME}.enc"
-OUTPUT_PATH="${TARGET_DIR}/${ARCHIVE_ENC_NAME}"
+  log_info "Selected ${#SOURCE_ARRAY[@]} source(s):"
+  local s
+  for s in "${SOURCE_ARRAY[@]}"; do printf "%s %s\n" "$(ts)" "$s"; done
 
-if [ -e "$OUTPUT_PATH" ]; then
-  log_warn "Output file already exists: $OUTPUT_PATH"
-  read -r -p "$(ts) [INPUT] Overwrite? [y/N]: " ow
-  case "${ow:-N}" in
-    y|Y) log_info "Will overwrite existing file." ;;
-    *) log_info "Aborted by user."; exit 1 ;;
-  esac
-fi
+  log_info "Selecting target save directory…"
+  local TARGET_DIR=""
+  if [ "$is_macos" = true ]; then
+    TARGET_DIR="$(choose_directory_gui_macos || true)"
+  elif [ "$is_linux" = true ]; then
+    TARGET_DIR="$(choose_directory_gui_linux || true)"
+  fi
+  if [ -z "${TARGET_DIR:-}" ]; then
+    log_info "Falling back to CLI directory prompt."
+    TARGET_DIR="$(prompt_directory_cli)"
+  fi
+  if [ ! -d "$TARGET_DIR" ] || [ ! -w "$TARGET_DIR" ]; then
+    log_error "Target directory is not writable: $TARGET_DIR"
+    exit 1
+  fi
+  TARGET_DIR="${TARGET_DIR%/}"
 
-# ---------- Read passphrase ----------
-PASSPHRASE="$(read_passphrase)"
+  local default_base="archive_$(date +'%Y%m%d_%H%M%S')"
+  printf "%s [INPUT] Archive base name (no extension) [%s]: " "$(ts)" "$default_base"
+  local ARCHIVE_BASE=""
+  read -r ARCHIVE_BASE
+  ARCHIVE_BASE="${ARCHIVE_BASE:-$default_base}"
 
-# ---------- Encryption parameter assembly ----------
-OPENSSL_ENC_ARGS=(-e -aes-256-cbc -salt -a -out "$OUTPUT_PATH")
-# Prefer SHA-256 and PBKDF2 if available
-if [ "$OPENSSL_HAS_MD_SHA256" = true ]; then
-  OPENSSL_ENC_ARGS+=(-md sha256)
-fi
-if [ "$OPENSSL_HAS_PBKDF2" = true ]; then
-  OPENSSL_ENC_ARGS+=(-pbkdf2 -iter 200000)
-else
-  log_warn "Using legacy key derivation (no -pbkdf2)."
-fi
+  local ARCHIVE_TMP_NAME="${ARCHIVE_BASE}.tar.gz"
+  local ARCHIVE_ENC_NAME="${ARCHIVE_TMP_NAME}.enc"
+  local OUTPUT_PATH="${TARGET_DIR}/${ARCHIVE_ENC_NAME}"
 
-# Supply passphrase on a separate fd to avoid exposing it via arguments and to keep stdin for data
-exec 3<<<"$PASSPHRASE"
-unset PASSPHRASE
+  if [ -e "$OUTPUT_PATH" ]; then
+    log_warn "Output file already exists: $OUTPUT_PATH"
+    if ! prompt_yes_no_cli "Overwrite existing file?"; then
+      log_info "Aborted by user."
+      exit 1
+    fi
+  fi
 
-# ---------- Compress and encrypt (streaming; no intermediate files) ----------
-log_info "Creating compressed archive and encrypting to: $OUTPUT_PATH"
+  local PASSPHRASE=""
+  PASSPHRASE="$(read_passphrase_confirm)"
+  exec 3<<<"$PASSPHRASE"
+  unset PASSPHRASE
 
-tmp_list="$(mktemp)"
-trap 'rm -f "$tmp_list"' EXIT
+  # Build OpenSSL args
+  # shellcheck disable=SC2207
+  local ENC_ARGS=($(build_openssl_enc_args))
 
-for s in "${SOURCE_ARRAY[@]}"; do printf "%s\n" "$s"; done > "$tmp_list"
+  log_info "Creating compressed archive and encrypting to: $OUTPUT_PATH"
 
-# Stream: tar -> gzip -> stdout -> openssl enc -> OUTPUT_PATH
-# shellcheck disable=SC2086
-if tar -cz -v -f - --files-from="$tmp_list" 2> >(while IFS= read -r line; do printf "%s [TAR]   %s\n" "$(ts)" "$line"; done >&2) \
-  | openssl enc "${OPENSSL_ENC_ARGS[@]}" -pass fd:3; then
-  log_info "Encryption complete."
-else
-  log_error "Compression/encryption failed."
-  exit 1
-fi
+  local tmp_list=""
+  tmp_list="$(mktemp)"
+  trap 'rm -f "$tmp_list"' EXIT
 
-# ---------- Post-run summary ----------
-log_info "Encrypted archive saved:"
-printf "%s %s\n" "$(ts)" "$OUTPUT_PATH"
+  for s in "${SOURCE_ARRAY[@]}"; do printf "%s\n" "$s"; done > "$tmp_list"
 
-cat <<EOF
-$(ts) [INFO]  To decrypt:
+  # tar -> gzip -> stdout -> openssl enc -> OUTPUT_PATH
+  # shellcheck disable=SC2086
+  if tar -cz -v -f - --files-from="$tmp_list" 2> >(while IFS= read -r line; do printf "%s [TAR]   %s\n" "$(ts)" "$line"; done >&2) \
+    | openssl enc "${ENC_ARGS[@]}" -out "$OUTPUT_PATH" -pass fd:3; then
+    log_info "Encryption complete."
+  else
+    log_error "Compression/encryption failed."
+    exit 1
+  fi
+
+  log_info "Encrypted archive saved:"
+  printf "%s %s\n" "$(ts)" "$OUTPUT_PATH"
+
+  cat <<EOF
+$(ts) [INFO]  To decrypt (manual):
 $(ts) [INFO]    openssl enc -d -aes-256-cbc -a -in "$OUTPUT_PATH" -out "${TARGET_DIR}/${ARCHIVE_TMP_NAME}" ${OPENSSL_HAS_MD_SHA256:+-md sha256} ${OPENSSL_HAS_PBKDF2:+-pbkdf2 -iter 200000}
 $(ts) [INFO]  Then extract:
 $(ts) [INFO]    tar -xz -v -f "${TARGET_DIR}/${ARCHIVE_TMP_NAME}" -C /desired/restore/path
 EOF
+}
+
+# ---------- Decrypt workflow ----------
+run_decrypt() {
+  log_info "Mode: DECRYPT"
+
+  log_info "Selecting encrypted .enc file…"
+  local ENC_FILE=""
+  if [ "$is_macos" = true ]; then
+    ENC_FILE="$(choose_file_gui_macos_decrypt || true)"
+  elif [ "$is_linux" = true ]; then
+    ENC_FILE="$(choose_file_gui_linux_decrypt || true)"
+  fi
+  if [ -z "${ENC_FILE:-}" ]; then
+    log_info "Falling back to CLI file prompt."
+    ENC_FILE="$(prompt_file_cli_decrypt)"
+  fi
+  if [ ! -f "$ENC_FILE" ]; then
+    log_error "File does not exist: $ENC_FILE"
+    exit 1
+  fi
+
+  log_info "Selecting target save directory for decrypted .tar.gz…"
+  local TARGET_DIR=""
+  if [ "$is_macos" = true ]; then
+    TARGET_DIR="$(choose_directory_gui_macos || true)"
+  elif [ "$is_linux" = true ]; then
+    TARGET_DIR="$(choose_directory_gui_linux || true)"
+  fi
+  if [ -z "${TARGET_DIR:-}" ]; then
+    log_info "Falling back to CLI directory prompt."
+    TARGET_DIR="$(prompt_directory_cli)"
+  fi
+  if [ ! -d "$TARGET_DIR" ] || [ ! -w "$TARGET_DIR" ]; then
+    log_error "Target directory is not writable: $TARGET_DIR"
+    exit 1
+  fi
+  TARGET_DIR="${TARGET_DIR%/}"
+
+  # Determine output tar.gz name from input (strip trailing .enc)
+  local base_name=""
+  base_name="$(basename -- "$ENC_FILE")"
+  if printf "%s" "$base_name" | grep -q '\.enc$'; then
+    base_name="${base_name%*.enc}"
+  else
+    # If user picked a file without .enc, still proceed
+    log_warn "Selected file does not end with .enc; output will be '<name>.tar.gz'."
+  fi
+  # If it doesn't end with .tar.gz already, enforce .tar.gz
+  if ! printf "%s" "$base_name" | grep -q '\.tar\.gz$'; then
+    base_name="${base_name}.tar.gz"
+  fi
+  local DECRYPTED_TAR="${TARGET_DIR}/${base_name}"
+
+  if [ -e "$DECRYPTED_TAR" ]; then
+    log_warn "Output file already exists: $DECRYPTED_TAR"
+    if ! prompt_yes_no_cli "Overwrite existing file?"; then
+      log_info "Aborted by user."
+      exit 1
+    fi
+  fi
+
+  local PASSPHRASE=""
+  PASSPHRASE="$(read_passphrase_once)"
+  exec 3<<<"$PASSPHRASE"
+  unset PASSPHRASE
+
+  # shellcheck disable=SC2207
+  local DEC_ARGS=($(build_openssl_dec_args))
+
+  log_info "Decrypting to: $DECRYPTED_TAR"
+  if openssl enc "${DEC_ARGS[@]}" -in "$ENC_FILE" -out "$DECRYPTED_TAR" -pass fd:3; then
+    log_info "Decryption complete: $DECRYPTED_TAR"
+  else
+    log_error "Decryption failed. Wrong passphrase or incompatible parameters?"
+    exit 1
+  fi
+
+  # Optional extraction prompt
+  if prompt_yes_no_cli "Extract the decrypted archive now?"; then
+    log_info "Selecting extraction directory…"
+    local EXTRACT_DIR=""
+    if [ "$is_macos" = true ]; then
+      EXTRACT_DIR="$(choose_directory_gui_macos || true)"
+    elif [ "$is_linux" = true ]; then
+      EXTRACT_DIR="$(choose_directory_gui_linux || true)"
+    fi
+    if [ -z "${EXTRACT_DIR:-}" ]; then
+      log_info "Falling back to CLI directory prompt."
+      EXTRACT_DIR="$(prompt_directory_cli)"
+    fi
+    if [ ! -d "$EXTRACT_DIR" ] || [ ! -w "$EXTRACT_DIR" ]; then
+      log_error "Extraction directory is not writable: $EXTRACT_DIR"
+      exit 1
+    fi
+    EXTRACT_DIR="${EXTRACT_DIR%/}"
+
+    log_info "Extracting to: $EXTRACT_DIR"
+    if tar -xz -v -f "$DECRYPTED_TAR" -C "$EXTRACT_DIR" 2> >(while IFS= read -r line; do printf "%s [TAR]   %s\n" "$(ts)" "$line"; done >&2); then
+      log_info "Extraction complete."
+    else
+      log_error "Extraction failed."
+      exit 1
+    fi
+  else
+    log_info "Skipping extraction as requested."
+  fi
+
+  log_info "Done."
+}
+
+# ---------- Main ----------
+main() {
+  local mode=""
+  mode="$(choose_mode)"
+  case "$mode" in
+    encrypt) run_encrypt ;;
+    decrypt) run_decrypt ;;
+    *) log_warn "No mode selected. Defaulting to ENCRYPT."; run_encrypt ;;
+  esac
+}
+
+main "$@"
